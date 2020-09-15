@@ -39,8 +39,8 @@
   * \author Radu Bogdan Rusu
   *
   * @b virtual_scanner takes in a .ply or a .vtk file of an object model, and virtually scans it
-  * in a raytracing fashion, saving the end results as PCD (Point Cloud Data) files. In addition, 
-  * it noisifies the PCD models, and downsamples them. 
+  * in a raytracing fashion, saving the end results as PCD (Point Cloud Data) files. In addition,
+  * it noisifies the PCD models, and downsamples them.
   * The viewpoint can be set to 1 or multiple views on a sphere.
   */
 #include <string>
@@ -52,379 +52,295 @@
 #include <pcl/console/parse.h>
 #include <pcl/visualization/vtk.h>
 #include "boost.h"
+#include "vtkGeneralTransform.h"
+#include "vtkTransform.h"
+#include "vtkCellLocator.h"
+
 using namespace pcl;
 
 #define EPS 0.00001
 
+//struct ScanParameters
+//{
+//    int nr_scans;             // number of steps for sweep movement
+//    int nr_points_in_scans;   // number of laser beam measurements per scan
+//    double vert_res;          // vertical resolution (res. of sweep) in degrees
+//    double hor_res;           // horizontal  resolution (of laser beam) in degrees
+//    double max_dist;          // maximum distance in units.
+//};
+
+const double pi = 3.14159265358979f;
 struct ScanParameters
 {
-  int nr_scans;             // number of steps for sweep movement
-  int nr_points_in_scans;   // number of laser beam measurements per scan
-  double vert_res;          // vertical resolution (res. of sweep) in degrees
-  double hor_res;           // horizontal  resolution (of laser beam) in degrees
-  double max_dist;          // maximum distance in units.
+    double fov_vert;          // vertical fov in radian
+    double fov_hor;           // horizontal fov in radian
+    int    res_vert;          // vertical resolution
+    int    res_hor;           // horizontal  resolution
+    double distance;          // distance in mm
+    double screen_dist;       // screen distance in mm
+    //    double viewPoint;          // distance in mm
 };
 
+using namespace std;
+void PrintUsage(){
+    cout<<"Usage: ./scanner [options] model.ply viewpoints.ply"<<endl;
+    cout<<"[options]"<<endl;
+    cout<<"\t-interval       <double>  : distance intervals (default:1)"<<endl;
+    cout<<"\t-max            <double>  : maximum distance to scan (default:10)"<<endl;
+    cout<<"\t-foi        <vert> <hor>  : foi in degree (default: )"<<endl;
+    cout<<"\t-resolution <vert> <hor>  : resolution in integers (default: )"<<endl;
+}
 
-/** \brief Loads a 3D point cloud from a given fileName, and returns: a
-  * vtkDataSet object containing the point cloud.
-  * \param file_name the name of the file containing the dataset
-  */
-vtkPolyData*
-loadDataSet (const char* file_name)
+void EstimateColor(vtkPolyData* data, vtkIdType cellId, double* point, double* rgb);
+
+int main (int argc, char** argv)
 {
-  std::string extension = boost::filesystem::extension (file_name);
-  if (extension == ".ply")
-  {
+    //arguements
+    string modelFileName = argv[argc-2];
+    string viewFileName  = argv[argc-1];
+    double interval(1.), maxDist(10.);
+ /*   for(int i=1;i<argc-1;i++){
+        if(argv[i]=="-interval") interval = atof(argv[++i]);
+        else if(argv[i]=="-max") maxDist  = atof(argv[++i]);
+        else PrintUsage();
+    }*/
+
+    //set scan parameters
+    ScanParameters scan;
+    scan.fov_hor  = 90.*pi/180.;
+    scan.fov_vert = 59.*pi/180.;
+    scan.res_hor  = 1280;
+    scan.res_vert  = 720;
+//    scan.distance = 1000; //mm
+//    scan.screen_dist = 5000; //mm
+    scan.distance = 4000; //mm
+    scan.screen_dist = 5000; //mm
+
+    //read ply file
+    vtkSmartPointer<vtkPolyData> data;
     vtkPLYReader* reader = vtkPLYReader::New ();
-
-    reader->SetFileName (file_name);
+    reader->SetFileName (modelFileName.c_str ());
     reader->Update ();
-    return (reader->GetOutput ());
-  }
-  else
-  {
-    PCL_ERROR ("Needs a PLY file to continue.\n");
-    return (NULL);
-  }
-}
+    data = reader->GetOutput ();
 
-int
-main (int argc, char** argv)
-{
-  if (argc < 2)
-  {
-    PCL_INFO ("Usage %s [options] <model.ply | model.vtk>\n", argv[0]);
-    PCL_INFO (" * where options are:\n"
-              "         -object_coordinates <0|1> : save the dataset in object coordinates (1) or camera coordinates (0)\n"
-              "         -single_view <0|1>        : take a single snapshot (1) or record a lot of camera poses on a view sphere (0)\n"
-              "         -view_point <x,y,z>       : set the camera viewpoint from where the acquisition will take place\n"
-              "         -target_point <x,y,z>     : the target point that the camera should look at (default: 0, 0, 0)\n"
-              "         -organized <0|1>          : create an organized, grid-like point cloud of width x height (1), or keep it unorganized with height = 1 (0)\n"
-              "         -noise <0|1>              : add gausian noise (1) or keep the model noiseless (0)\n"
-              "         -noise_std <x>            : use X times the standard deviation\n"
-              "");
-    return (-1);
-  }
-  std::string filename;
-  // Parse the command line arguments .ply files
-  std::vector<int> p_file_indices_ply = console::parse_file_extension_argument (argc, argv, ".ply");
-  bool object_coordinates = true;
-  console::parse_argument (argc, argv, "-object_coordinates", object_coordinates);
-  bool single_view = false;
-  console::parse_argument (argc, argv, "-single_view", single_view);
-  double vx = 0, vy = 0, vz = 0;
-  console::parse_3x_arguments (argc, argv, "-view_point", vx, vy, vz);
-  double tx = 0, ty = 0, tz = 0;
-  console::parse_3x_arguments (argc, argv, "-target_point", tx, ty, tz);
-  int organized = 0;
-  console::parse_argument (argc, argv, "-organized", organized);
-  if (organized)
-    PCL_INFO ("Saving an organized dataset.\n");
-  else
-    PCL_INFO ("Saving an unorganized dataset.\n");
+    // Build a spatial locator for our dataset
+    vtkSmartPointer<vtkCellLocator> tree = vtkSmartPointer<vtkCellLocator>::New ();
+    tree->SetDataSet (data);
+    tree->CacheCellBoundsOn ();
+    tree->SetTolerance (0.0);
+    tree->SetNumberOfCellsPerBucket (1);
+    tree->AutomaticOn ();
+    tree->BuildLocator ();
+    tree->Update ();
 
-  vtkSmartPointer<vtkPolyData> data;
-  // Loading PLY file
-  if (p_file_indices_ply.empty ())
-  {
-    PCL_ERROR ("Error: no .PLY file given!\n");
-    return (-1);
-  }
-  
-  std::stringstream filename_stream;
-  filename_stream << argv[p_file_indices_ply.at (0)];
-  filename = filename_stream.str ();
-  data = loadDataSet (filename.c_str ());
+    //read viewpoint ply file
+    vtkSmartPointer<vtkPolyData> viewPointData;
+    vtkPLYReader* viewPointReader = vtkPLYReader::New ();
+    viewPointReader->SetFileName (viewFileName.c_str ());
+    viewPointReader->Update ();
+    viewPointData = viewPointReader->GetOutput ();
 
-  PCL_INFO ("Loaded model with %d vertices/points.\n", data->GetNumberOfPoints ());
+    //get viewpoints
+    vector<double*> viewRays;
+    for(vtkIdType i=0;i<viewPointData->GetNumberOfCells();i++){
+        double a[3], b[3], c[3];
+        viewPointData->GetPoint(viewPointData->GetCell(i)->GetPointId(0), a);
+        viewPointData->GetPoint(viewPointData->GetCell(i)->GetPointId(1), b);
+        viewPointData->GetPoint(viewPointData->GetCell(i)->GetPointId(2), c);
 
-  // Default scan parameters
-  ScanParameters sp;
-  sp.nr_scans           = 900;
-  console::parse_argument (argc, argv, "-nr_scans", sp.nr_scans);
-  sp.nr_points_in_scans = 900;
-  console::parse_argument (argc, argv, "-pts_in_scan", sp.nr_points_in_scans);
-  sp.max_dist           = 30000;   // maximum distance (in mm)
-  sp.vert_res           = 0.25;
-  console::parse_argument (argc, argv, "-vert_res", sp.vert_res);
-  sp.hor_res            = 0.25;
-  console::parse_argument (argc, argv, "-hor_res", sp.hor_res);
-
-  int noise_model = 0;               // set the default noise level to none
-  console::parse_argument (argc, argv, "-noise", noise_model);
-  float noise_std = 0.05f;           // 0.5 standard deviations by default
-  console::parse_argument (argc, argv, "-noise_std", noise_std);
-  if (noise_model)
-    PCL_INFO ("Adding Gaussian noise to the final model with %f x std_dev.\n", noise_std);
-  else
-    PCL_INFO ("Not adding any noise to the final model.\n");
-
-  int subdiv_level = 1;
-  double scan_dist = 8;
-  std::string fname, base;
-  char seq[256];
-
-  // Compute start/stop for vertical and horizontal
-  double vert_start = - (static_cast<double> (sp.nr_scans - 1) / 2.0) * sp.vert_res;
-  double vert_end   = + ((sp.nr_scans-1) * sp.vert_res) + vert_start;
-  double hor_start  = - (static_cast<double> (sp.nr_points_in_scans - 1) / 2.0) * sp.hor_res;
-  double hor_end    = + ((sp.nr_points_in_scans-1) * sp.hor_res) + hor_start;
-
-  // Prepare the point cloud data
-//  pcl::PointCloud<pcl::PointWithViewpoint> cloud;
-
-  // Prepare the leaves for downsampling
-  pcl::VoxelGrid<pcl::PointWithViewpoint> grid;
-  grid.setLeafSize (2.5, 2.5, 2.5);    // @note: this value should be given in mm!
-
-  // Reset and set a random seed for the Global Random Number Generator
-  boost::mt19937 rng (static_cast<unsigned int> (std::time (0)));
-  boost::normal_distribution<float> normal_distrib (0.0f, noise_std * noise_std);
-  boost::variate_generator<boost::mt19937&, boost::normal_distribution<float> > gaussian_rng (rng, normal_distrib);
-
-  std::vector<std::string> st;
-  // Virtual camera parameters
-  double eye[3]     = {0.0, 0.0, 0.0};
-  double viewray[3] = {0.0, 0.0, 0.0};
-  double up[3]      = {0.0, 0.0, 0.0};
-  double right[3]  = {0.0, 0.0, 0.0};
-  double x_axis[3] = {1.0, 0.0, 0.0};
-  double z_axis[3] = {0.0, 0.0, 1.0};
-  double bounds[6];
-  double temp_beam[3], beam[3], p[3];
-  double p_coords[3], x[3], t;
-  int subId;
- 
-  // Create a Icosahedron at center in origin and radius of 1
-  vtkSmartPointer<vtkPlatonicSolidSource> icosa = vtkSmartPointer<vtkPlatonicSolidSource>::New ();
-  icosa->SetSolidTypeToIcosahedron ();
-
-  // Tesselize the source icosahedron (subdivide each triangular face
-  // of the icosahedron into smaller triangles)
-  vtkSmartPointer<vtkLoopSubdivisionFilter> subdivide = vtkSmartPointer<vtkLoopSubdivisionFilter>::New ();
-  subdivide->SetNumberOfSubdivisions (subdiv_level);
-  subdivide->SetInputConnection (icosa->GetOutputPort ());
-  subdivide->Update ();
-
-  // Get camera positions
-  vtkPolyData *sphere = subdivide->GetOutput ();
-  if (!single_view)
-    PCL_INFO ("Created %ld camera position points.\n", sphere->GetNumberOfPoints ());
-
-#include "vtkCellLocator.h"
-  // Build a spatial locator for our dataset
-  vtkSmartPointer<vtkCellLocator> tree = vtkSmartPointer<vtkCellLocator>::New ();
-  tree->SetDataSet (data);
-  tree->CacheCellBoundsOn ();
-  tree->SetTolerance (0.0);
-  tree->SetNumberOfCellsPerBucket (1);
-  tree->AutomaticOn ();
-  tree->BuildLocator ();
-  tree->Update ();
-
-  // Get the min-max bounds of data
-  data->GetBounds (bounds);
-
-  // if single view is required iterate over loop only once
-  int number_of_points = static_cast<int> (sphere->GetNumberOfPoints ());
-  if (single_view)
-    number_of_points = 1;
-
-  int sid = -1;
-  for (int i = 0; i < number_of_points; i++)
-  {
-    pcl::PointCloud<pcl::PointWithViewpoint> cloud;
-    sphere->GetPoint (i, eye);
-    if (fabs(eye[0]) < EPS) eye[0] = 0;
-    if (fabs(eye[1]) < EPS) eye[1] = 0;
-    if (fabs(eye[2]) < EPS) eye[2] = 0;
-
-    viewray[0] = -eye[0];
-    viewray[1] = -eye[1];
-    viewray[2] = -eye[2];
-    eye[0] *= scan_dist;
-    eye[1] *= scan_dist;
-    eye[2] *= scan_dist;
-    //Change here if only single view point is required
-    if (single_view)
-    {
-      eye[0] = vx;//0.0;
-      eye[1] = vy;//-0.26;
-      eye[2] = vz;//-0.86;
-      viewray[0] = tx - vx;
-      viewray[1] = ty - vy;
-      viewray[2] = tz - vz;
-      double len = sqrt (viewray[0]*viewray[0] + viewray[1]*viewray[1] + viewray[2]*viewray[2]);
-      if (len == 0)
-      {
-        PCL_ERROR ("The single_view option is enabled but the view_point and the target_point are the same!\n");
-        break;
-      }
-      viewray[0] /= len;
-      viewray[1] /= len;
-      viewray[2] /= len;
+        double ab[3], ac[3];
+        double* normal = new double[3];
+        vtkMath::Subtract(a,b,ab);
+        vtkMath::Subtract(a,c,ac);
+        vtkMath::Cross(ab, ac, normal);
+        vtkMath::Normalize(normal);
+        viewRays.push_back(normal);
     }
 
-    if ((viewray[0] == 0) && (viewray[1] == 0))
-      vtkMath::Cross (viewray, x_axis, right);
-    else
-      vtkMath::Cross (viewray, z_axis, right);
-    if (fabs(right[0]) < EPS) right[0] = 0;
-    if (fabs(right[1]) < EPS) right[1] = 0;
-    if (fabs(right[2]) < EPS) right[2] = 0;
+    // Virtual camera parameters
+    //double eye0[3]     = {0.0, 0.0, 0.0};
+    double viewray0[3] = {0.0, 0.0, -1.0};
+    double up0[3]      = {0.0, 1.0, 0.0}; //normalize
 
-    vtkMath::Cross (viewray, right, up);
-    if (fabs(up[0]) < EPS) up[0] = 0;
-    if (fabs(up[1]) < EPS) up[1] = 0;
-    if (fabs(up[2]) < EPS) up[2] = 0;
+    // Screen parameters
+    double hor_len  = (scan.distance+scan.screen_dist) * 2. * tan(scan.fov_hor*0.5);
+    double vert_len = (scan.distance+scan.screen_dist) * 2. * tan(scan.fov_vert*0.5);
+    double hor_interval  = hor_len  / (double) scan.res_hor;
+    double vert_interval = vert_len / (double) scan.res_vert;
+    cout<<hor_len<<"*"<<vert_len<<endl<<hor_interval<<"*"<<vert_interval<<endl;
 
-    if (!object_coordinates)
-    {
-      // Normalization
-      double right_len = sqrt (right[0]*right[0] + right[1]*right[1] + right[2]*right[2]);
-      right[0] /= right_len;
-      right[1] /= right_len;
-      right[2] /= right_len;
-      double up_len = sqrt (up[0]*up[0] + up[1]*up[1] + up[2]*up[2]);
-      up[0] /= up_len;
-      up[1] /= up_len;
-      up[2] /= up_len;
-    
-      // Output resulting vectors
-      cerr << "Viewray Right Up:" << endl;
-      cerr << viewray[0] << " " << viewray[1] << " " << viewray[2] << " " << endl;
-      cerr << right[0] << " " << right[1] << " " << right[2] << " " << endl;
-      cerr << up[0] << " " << up[1] << " " << up[2] << " " << endl;
-    }
+    ofstream log("labels.txt");
 
-    // Create a transformation
-    vtkGeneralTransform* tr1 = vtkGeneralTransform::New ();
-    vtkGeneralTransform* tr2 = vtkGeneralTransform::New ();
+    //vtkSmartPointer<vtkCellLocator> tree = vtkSmartPointer<vtkCellLocator>::New ();
+    vtkTransform* tr1 = vtkTransform::New ();
+    vtkTransform* tr = vtkTransform::New ();
+    vtkMatrix4x4* mat = vtkMatrix4x4::New();
+    vtkMatrix4x4* mat1 = vtkMatrix4x4::New();
+    for(int i=0;i<viewRays.size();i+=40){
+        log<<"viewpoint"<<i<<" "<<viewRays[i][0]<<" "<<viewRays[i][1]<<" "<<viewRays[i][2]<<endl;
+        //set viewray and upVector
+        double angle = vtkMath::AngleBetweenVectors(viewRays[i], viewray0); //radian
+        double axis[3], up1[3];
+        vtkMath::Cross(viewray0,viewRays[i], axis);
+        tr1->Identity ();
+        tr1->RotateWXYZ(angle*180/pi, axis); //requires angle in degree
+        tr1->TransformPoint(up0, up1);
+        tr1->Inverse();
+        tr1->GetMatrix(mat1);
+        vtkMath::Normalize(up1);
 
-    // right = viewray x up
-    vtkMath::Cross (viewray, up, right);
+        for(int deg = 0; deg<31; deg+=10){
+            cout<<"\rStart Scanning..."<<i<<"/"<<viewRays.size()<<" -deg: "<<deg<<flush;
+            double up[3], right[3];
+            tr->Identity ();
+            tr->RotateWXYZ((double)deg, viewRays[i]);
+            tr->TransformPoint(up1, up);
+            tr->Inverse();
+            tr->GetMatrix(mat);
+            vtkMatrix4x4::Multiply4x4(mat1,mat, mat);
+            tr->Identity();
+            tr->SetMatrix(mat);
 
-    // Sweep vertically
-    pcl::PointCloud<pcl::PointXYZ> cloudScreen;
-    for (double vert = vert_start; vert <= vert_end; vert += sp.vert_res)
-    {
-      sid++;
-      tr1->Identity ();
-      tr1->RotateWXYZ (vert, right);
-      tr1->InternalTransformPoint (viewray, temp_beam);
+            vtkMath::Normalize(up);
+            vtkMath::Cross(viewRays[i], up, right);
+            vtkMath::Normalize(right);
 
-      // Sweep horizontally
-      int pid = -1;
-      for (double hor = hor_start; hor <= hor_end; hor += sp.hor_res)
-      {
-        pid ++;
-      
-        // Create a beam vector with (lat,long) angles (vert, hor) with the viewray
-        tr2->Identity ();
-        tr2->RotateWXYZ (hor, up);
-        tr2->InternalTransformPoint (temp_beam, beam);
-        vtkMath::Normalize (beam);
+            //Start!!
+            double eye[3];
+            eye[0] = -viewRays[i][0]*scan.distance;
+            eye[1] = -viewRays[i][1]*scan.distance;
+            eye[2] = -viewRays[i][2]*scan.distance;
 
-        // Find point at max range: p = eye + beam * max_dist
-        for (int d = 0; d < 3; d++)
-          p[d] = eye[d] + beam[d] * sp.max_dist;
-        cloudScreen.push_back(pcl::PointXYZ(p[0], p[1], p[2]));
-        // Put p_coords into laser scan at packetid = vert, scan id = hor
-        vtkIdType cellId;
-        if (tree->IntersectWithLine (eye, p, 0, t, x, p_coords, subId, cellId))
-       {
-            //cout<<tree->GetDataSet()->GetCell(cellId)->GetPointId(0)<<endl;
-            //cout<<data->GetAttributes(0)->GetArray(0)->GetComponent(0,0);getchar();
-          pcl::PointWithViewpoint pt;
-          if (object_coordinates)
-          {
-            pt.x = static_cast<float> (x[0]); 
-            pt.y = static_cast<float> (x[1]); 
-            pt.z = static_cast<float> (x[2]);
-            pt.vp_x = static_cast<float> (eye[0]); 
-            pt.vp_y = static_cast<float> (eye[1]); 
-            pt.vp_z = static_cast<float> (eye[2]);
-          }
-          else
-          {
-            // z axis is the viewray
-            // y axis is up
-            // x axis is -right (negative because z*y=-x but viewray*up=right)
-            pt.x = static_cast<float> (-right[0]*x[1] + up[0]*x[2] + viewray[0]*x[0] + eye[0]);
-            pt.y = static_cast<float> (-right[1]*x[1] + up[1]*x[2] + viewray[1]*x[0] + eye[1]);
-            pt.z = static_cast<float> (-right[2]*x[1] + up[2]*x[2] + viewray[2]*x[0] + eye[2]);
-            pt.vp_x = pt.vp_y = pt.vp_z = 0.0f;
-          }
-          cloud.points.push_back (pt);
+            // Generate screen
+            double screen_center[3];
+            for(int n=0;n<3;n++) screen_center[n] = viewRays[i][n] * scan.screen_dist;
+            double screen_leftup[3];
+            for(int n=0;n<3;n++) screen_leftup[n] = screen_center[n]+up[n]*vert_len*0.5 - right[n]*hor_len*0.5;
+
+            pcl::PointCloud<pcl::PointXYZ> screenCloud;
+            for(int vert = 0 ; vert<scan.res_vert;vert++){
+                double left[3] = {screen_leftup[0] - up[0]*vert_interval*(vert+0.5),
+                                  screen_leftup[1] - up[1]*vert_interval*(vert+0.5),
+                                  screen_leftup[2] - up[2]*vert_interval*(vert+0.5)};
+                for(int hor = 0 ; hor<scan.res_hor;hor++){
+                    double point[3] = {left[0]+right[0]*hor_interval*(hor+0.5),
+                                       left[1]+right[1]*hor_interval*(hor+0.5),
+                                       left[2]+right[2]*hor_interval*(hor+0.5)};
+                    screenCloud.push_back(pcl::PointXYZ(point[0], point[1], point[2]));
+                }
+            }
+
+            // Scanning
+            pcl::PointCloud<pcl::PointXYZ> cloud;
+            vector<double> xx, yy, zz;
+            vector<int> rr, gg, bb;
+            double p_coords[3], x[3], t, rgb[3];
+            int subId;
+            for(int vert = 0 ; vert<scan.res_vert;vert++){
+                for(int hor = 0 ; hor<scan.res_hor;hor++){
+                    vtkIdType cellId;
+                    double point[3];
+                    point[0] = screenCloud.at(vert*scan.res_hor+hor).x;
+                    point[1] = screenCloud.at(vert*scan.res_hor+hor).y;
+                    point[2] = screenCloud.at(vert*scan.res_hor+hor).z;
+                    if (tree->IntersectWithLine (eye, point, 0, t, x, p_coords, subId, cellId))
+                    {
+                        EstimateColor(data, cellId, x, rgb);
+                        rr.push_back(floor(rgb[0]+0.5));gg.push_back(floor(rgb[1]+0.5));bb.push_back(floor(rgb[2]+0.5));
+                        xx.push_back(x[0]);yy.push_back(x[1]);zz.push_back(x[2]);
+
+                        //vtkMath::Subtract(x,data->GetCenter(),x);
+                        tr->TransformPoint(x,x);
+                        cloud.push_back (PointXYZ(x[0], x[1], x[2]));
+                    }
+                    //else cloud.push_back (PointXYZ(0,0,0));
+                    else{
+                        rr.push_back(0);gg.push_back(0);bb.push_back(0);
+                        xx.push_back(point[0]);yy.push_back(point[1]);zz.push_back(point[2]);
+                        //vtkMath::Subtract(point,data->GetCenter(),point);
+                        tr->TransformPoint(point,point);
+                        cloud.push_back (PointXYZ(point[0],point[1],point[2]));
+                    }
+                } // Horizontal
+            } // Vertical
+
+            log<<to_string(i)+" "+to_string(deg)<<" "<<"upVector: "<<up[0]<<" "<<up[1]<<" "<<up[2]<<endl;
+            log<<*mat<<endl;
+            //mat->Print(cout);
+            pcl::PCDWriter writer;
+            writer.writeBinaryCompressed(to_string(i)+"_r"+to_string(deg)+".pcd", cloud);
+            ofstream ofs(to_string(i)+"_r"+to_string(deg)+".ply");
+            ofs<<"ply"<<endl;
+            ofs<<"format ascii 1.0"<<endl;
+            ofs<<"comment exported in vitual_scanner"<<endl;
+            ofs<<"element vertex "<<xx.size()<<endl;
+            ofs<<"property float x"<<endl;
+            ofs<<"property float y"<<endl;
+            ofs<<"property float z"<<endl;
+            ofs<<"property uchar red"<<endl;
+            ofs<<"property uchar green"<<endl;
+            ofs<<"property uchar blue"<<endl;
+            ofs<<"end_header"<<endl;
+            for(int idx=0;idx<xx.size();idx++)
+                ofs<<xx[idx]<<" "<<yy[idx]<<" "<<zz[idx]<<" "<<rr[idx]<<" "<<gg[idx]<<" "<<bb[idx]<<endl;
+            ofs.close();
         }
-        else
-          if (organized)
-          {
-            pcl::PointWithViewpoint pt;
-            pt.x = pt.y = pt.z = std::numeric_limits<float>::quiet_NaN ();
-            pt.vp_x = static_cast<float> (eye[0]);
-            pt.vp_y = static_cast<float> (eye[1]);
-            pt.vp_z = static_cast<float> (eye[2]);
-            cloud.points.push_back (pt);
-          }
-      } // Horizontal
-    } // Vertical
-
-    // Noisify each point in the dataset
-    // \note: we might decide to noisify along the ray later
-    for (size_t cp = 0; cp < cloud.points.size (); ++cp)
-    {
-      // Add noise ?
-      switch (noise_model)
-      {
-        // Gaussian
-        case 1: { cloud.points[cp].x += gaussian_rng (); cloud.points[cp].y += gaussian_rng (); cloud.points[cp].z += gaussian_rng (); break; }
-      }
-    }
-
-    // Downsample and remove silly point duplicates
-    pcl::PointCloud<pcl::PointWithViewpoint> cloud_downsampled;
-    grid.setInputCloud (boost::make_shared<pcl::PointCloud<pcl::PointWithViewpoint> > (cloud));
-    //grid.filter (cloud_downsampled);
-
-    // Saves the point cloud data to disk
-    sprintf (seq, "%d", i);
-    boost::trim (filename);
-    boost::split (st, filename, boost::is_any_of ("/\\"), boost::token_compress_on);
-
-    std::stringstream ss;
-    std::string output_dir = st.at (st.size () - 1);
-    ss << output_dir << "_output";
-
-    boost::filesystem::path outpath (ss.str ());
-    if (!boost::filesystem::exists (outpath))
-    {
-      if (!boost::filesystem::create_directories (outpath))
-      {
-        PCL_ERROR ("Error creating directory %s.\n", ss.str ().c_str ());
-        return (-1);
-      }
-      PCL_INFO ("Creating directory %s\n", ss.str ().c_str ());
-    }
-
-    fname = ss.str () + "/" + seq + ".pcd";
-
-    if (organized)
-    {
-      cloud.height = 1 + static_cast<uint32_t> ((vert_end - vert_start) / sp.vert_res);
-      cloud.width = 1 + static_cast<uint32_t> ((hor_end - hor_start) / sp.hor_res);
-    }
-    else
-    {
-      cloud.width = static_cast<uint32_t> (cloud.points.size ());
-      cloud.height = 1;
-    }
-
-    pcl::PCDWriter writer;
-    PCL_INFO ("Wrote %lu points (%d x %d) to %s\n", cloud.points.size (), cloud.width, cloud.height, fname.c_str ());
-    writer.writeBinaryCompressed (fname.c_str (), cloud);
-  } // sphere
-  return (0);
+    }log.close();
+    return 0;
 }
-/* ]--- */
+void EstimateColor(vtkPolyData* poly, vtkIdType cellId, double* point, double* rgb){
+    double a[3], b[3], c[3];
+    poly->GetPoint(poly->GetCell(cellId)->GetPointId(0), a);
+    poly->GetPoint(poly->GetCell(cellId)->GetPointId(1), b);
+    poly->GetPoint(poly->GetCell(cellId)->GetPointId(2), c);
+    double ab[3], ac[3], ba[3], bc[3];
+    vtkMath::Subtract(b, a, ab);
+    vtkMath::Subtract(c, a, ac);
+    vtkMath::Subtract(a, b, ba);
+    vtkMath::Subtract(c, b, bc);
+
+    double n0[3], n[3], end[3], l[3], d, l0p0[3];
+    //a (p0=b, l0=a, l=ap, n0=(baXbc), n=n0Xbc)
+    vtkMath::Subtract(point, a, l); //l=ap
+    vtkMath::Cross(ba, bc, n0);     //n0
+    vtkMath::Cross(n0, bc, n);      //n
+    vtkMath::Subtract(b, a, l0p0);  //l0p0=p0-l0
+    d = vtkMath::Dot(l0p0, n)/vtkMath::Dot(l, n);
+    vtkMath::MultiplyScalar(l, d);
+    vtkMath::Add(a, l, end);
+    double a_w = sqrt(vtkMath::Distance2BetweenPoints(point, end)/vtkMath::Distance2BetweenPoints(a, end));
+    //b (p0=a, l0=b, l=bp, n0=(abXac), n=n0Xac)
+    vtkMath::Subtract(point, b, l); //l=bp
+    vtkMath::Cross(ab, ac, n0);     //n0
+    vtkMath::Cross(n0, ac, n);      //n
+    vtkMath::Subtract(a, b, l0p0);  //l0p0=p0-l0
+    d = vtkMath::Dot(l0p0, n)/vtkMath::Dot(l, n);
+    vtkMath::MultiplyScalar(l, d);
+    vtkMath::Add(b, l, end);
+    double b_w = sqrt(vtkMath::Distance2BetweenPoints(point, end)/vtkMath::Distance2BetweenPoints(b, end));
+    //c (p0=a, l0=c, l=cp, n0=(baXbc), n=n0Xba)
+    vtkMath::Subtract(point, c, l); //l=cp
+    vtkMath::Cross(ba, bc, n0);     //n0
+    vtkMath::Cross(n0, ba, n);      //n
+    vtkMath::Subtract(a, c, l0p0);  //l0p0=p0-l0
+    d = vtkMath::Dot(l0p0, n)/vtkMath::Dot(l, n);
+    vtkMath::MultiplyScalar(l, d);
+    vtkMath::Add(c, l, end);
+    double c_w = sqrt(vtkMath::Distance2BetweenPoints(point, end)/vtkMath::Distance2BetweenPoints(c, end));
+
+    double rgb_a[3] = {poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(0),0),
+                       poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(0),1),
+                       poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(0),2)};
+    double rgb_b[3] = {poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(1),0),
+                       poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(1),1),
+                       poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(1),2)};
+    double rgb_c[3] = {poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(2),0),
+                       poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(2),1),
+                       poly->GetAttributes(0)->GetArray(0)->GetComponent(poly->GetCell(cellId)->GetPointId(2),2)};
+
+    vtkMath::MultiplyScalar(rgb_a, a_w);
+    vtkMath::MultiplyScalar(rgb_b, b_w);
+    vtkMath::MultiplyScalar(rgb_c, c_w);
+    vtkMath::Add(rgb_a, rgb_b, rgb);
+    vtkMath::Add(rgb, rgb_c, rgb);
+}
