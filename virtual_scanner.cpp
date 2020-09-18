@@ -60,15 +60,6 @@ using namespace pcl;
 
 #define EPS 0.00001
 
-//struct ScanParameters
-//{
-//    int nr_scans;             // number of steps for sweep movement
-//    int nr_points_in_scans;   // number of laser beam measurements per scan
-//    double vert_res;          // vertical resolution (res. of sweep) in degrees
-//    double hor_res;           // horizontal  resolution (of laser beam) in degrees
-//    double max_dist;          // maximum distance in units.
-//};
-
 const double pi = 3.14159265358979f;
 struct ScanParameters
 {
