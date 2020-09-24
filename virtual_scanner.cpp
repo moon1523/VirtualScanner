@@ -44,17 +44,12 @@
   * The viewpoint can be set to 1 or multiple views on a sphere.
   */
 #include <string>
-#include <pcl/register_point_struct.h>
-#include <pcl/io/pcd_io.h>
-#include <pcl/io/vtk_lib_io.h>
-#include <pcl/filters/voxel_grid.h>
-#include <pcl/point_types.h>
-#include <pcl/console/parse.h>
-#include <pcl/visualization/vtk.h>
 #include "boost.h"
 #include "vtkGeneralTransform.h"
 #include "vtkTransform.h"
 #include "vtkCellLocator.h"
+
+#include "functions.cpp"
 
 using namespace pcl;
 
@@ -71,23 +66,35 @@ struct ScanParameters
     double screen_dist;       // screen distance in mm
     int    rotInterval;       // rotation interval in degree
 };
-
 using namespace std;
 void PrintUsage(){
     cout<<"Usage: ./scanner [options] model.ply viewpoints.ply"<<endl;
     cout<<"[options]"<<endl;
-    cout<<"\t-dist       <double>  : scan distance in mm (default:3000)"<<endl;
-    cout<<"                          or put three numbers for multiple distances [start] [interval] [#]"<<endl;
-    cout<<"\t-rot        <int>     : rotation interval in degree (default:10)"<<endl;
-    cout<<"\t-path       <string>  : directory path for result files (default: .)"<<endl;
+    cout<<"\t-dist <double> : scan distance in mm (default:3000)"<<endl;
+    cout<<"                   or put three numbers for multiple distances [start] [interval] [#]"<<endl;
+    cout<<"\t-rot  <int>    : rotation interval in degree (default:10)"<<endl;
+    cout<<"\t-path <string> : directory path for result files (default: .)"<<endl;
+    cout<<"\t-cv   [depth/color/both] : print openCV matrix in YML"<<endl;
+    cout<<"\t-ply  [0/1]    : print point cloud w/ color in PLY [0:object fixed/1:camera fixed]"<<endl;
+    cout<<"\t-pcd  [0/1]    : quick print of point cloud w/o color in PCD [0:object fixed/1:camera fixed]"<<endl;
     exit(1);
+}
+void PrintKeyUsage(){
+    cout<<"[Key Usage]"<<endl;
+    cout<<"\tw : write template"<<endl;
+    cout<<"\tv : to next view"<<endl;
+    cout<<"\tf : show the number of failed templates"<<endl;
 }
 
 void EstimateColor(vtkPolyData* data, vtkIdType cellId, double* point, double* rgb);
+void drawResponse(const std::vector<cv::linemod::Template>& templates,
+    int num_modalities, cv::Mat& dst, cv::Point offset, int T);
+static void writeLinemod(const cv::Ptr<cv::linemod::Detector>& detector, const std::string& filename);
 
 int main (int argc, char** argv)
 {
     //arguements (file names)
+    if(argc<3) PrintUsage();
     string modelFileName = argv[argc-2];
     string viewFileName  = argv[argc-1];
 
@@ -104,6 +111,8 @@ int main (int argc, char** argv)
 
     //arguments2
     string path(".");
+    bool cvDepth(false), cvColor(false);
+    bool pcd(false), pcd_rot(false), ply(false), ply_rot(false);
     for(int i=1;i<argc-2;i++){
         if(string(argv[i])=="-dist"){
             stringstream ss(argv[++i]);
@@ -117,6 +126,19 @@ int main (int argc, char** argv)
         }
         else if(string(argv[i])=="-rot")  scan.rotInterval = atoi(argv[++i]);
         else if(string(argv[i])=="-path") path = argv[++i];
+        else if(string(argv[i])=="-cv"){
+            if(string(argv[++i])=="depth") cvDepth = true;
+            else if(string(argv[i])=="color") cvColor = true;
+            else if(string(argv[i])=="both") {cvDepth = true; cvColor = true;}
+        }
+        else if(string(argv[i])=="-pcd"){
+            pcd = true;
+            if(atoi(argv[++i])==1) pcd_rot = true;
+        }
+        else if(string(argv[i])=="-ply"){
+            ply = true;
+            if(atoi(argv[++i])==1) ply_rot = true;
+        }
 
         else PrintUsage();
     }
@@ -129,6 +151,23 @@ int main (int argc, char** argv)
     reader->Update ();
     data = reader->GetOutput ();
 
+    // Set the distance range
+    double maxExt2(0);
+    for(int i=0;i<data->GetNumberOfPoints();i++){
+        double origin[3] = {0,0,0}, point[3];
+        origin, data->GetPoint(i, point);
+        double dist2 = vtkMath::Distance2BetweenPoints(origin, point);
+        maxExt2 = dist2>maxExt2? dist2:maxExt2;
+    }
+    double maxExt  = sqrt(maxExt2);
+    double minDist = scandists[0]-maxExt-100 < 0? 0:scandists[0]-maxExt-100;
+    double maxDist = scandists.back() + maxExt + 100;
+    double depthFactor = 2000./(maxDist-minDist) > 1? 1:2000./(maxDist-minDist);
+    if(maxDist<2000) minDist = 0;
+    cout<<"min. distance: "<<minDist<<endl;
+    cout<<"max. distance: "<<maxDist<<endl;
+
+    cout<<"Initializing..."<<flush;
     // Build a spatial locator for our dataset
     vtkSmartPointer<vtkCellLocator> tree = vtkSmartPointer<vtkCellLocator>::New ();
     tree->SetDataSet (data);
@@ -158,14 +197,13 @@ int main (int argc, char** argv)
         double* normal = new double[3];
         vtkMath::Subtract(a,b,ab);
         vtkMath::Subtract(a,c,ac);
-        vtkMath::Cross(ab, ac, normal);
+        vtkMath::Cross(ac, ab, normal);
         vtkMath::Normalize(normal);
         viewRays.push_back(normal);
     }
 
     // Virtual camera parameters
-    //double eye0[3]     = {0.0, 0.0, 0.0};
-    double viewray0[3] = {0.0, 0.0, -1.0};
+    double viewray0[3] = {0.0, 0.0, 1.0};
     double up0[3]      = {0.0, 1.0, 0.0}; //normalize
 
     // Screen parameters
@@ -173,18 +211,43 @@ int main (int argc, char** argv)
     double vert_len = (scan.distance+scan.screen_dist) * 2. * tan(scan.fov_vert*0.5);
     double hor_interval  = hor_len  / (double) scan.res_hor;
     double vert_interval = vert_len / (double) scan.res_vert;
-    cout<<hor_len<<"*"<<vert_len<<endl<<hor_interval<<"*"<<vert_interval<<endl;
+
+    //create buffer for PLY/PCD print
+    vector<double*> xyz;
+    if(pcd||ply){
+        xyz.reserve(scan.res_vert*scan.res_hor);
+        for(int n=0;n<scan.res_vert*scan.res_hor;n++){
+            xyz[n] = new double[3];
+        }
+    }
+
+    //Initialize LINEMOD detector
+    cv::Ptr<cv::linemod::Detector> detector;
+    detector = cv::linemod::getDefaultLINEMOD();
+    int num_modalities = (int)detector->getModalities().size();
+
+    //OpenCV windows
+    cv::namedWindow("depth");
+    cv::namedWindow("color");
+    cv::namedWindow("mask");
+    Mouse::start("color");
 
     //main loop start
     if(path!=".") system(("mkdir "+path).c_str());
     ofstream log(path+"/labels.txt");
+    log<<"maxDist "<<maxDist<<endl;
+    log<<"minDist "<<minDist<<endl<<endl;
     vtkTransform* tr1 = vtkTransform::New ();
     vtkTransform* tr = vtkTransform::New ();
     vtkMatrix4x4* mat = vtkMatrix4x4::New();
     vtkMatrix4x4* mat1 = vtkMatrix4x4::New();
+
+    //int totScans = viewRays.size()*scandists.size()*360./(double)scan.rotInterval;
+    int totScans = viewRays.size()*scandists.size()*11;
+    int failCount(0), scanCount(0), skipCount(0);
     for(int i=0;i<viewRays.size();i++){ //viewpoint loop
 
-        log<<"viewpoint"<<i<<" "<<viewRays[i][0]<<" "<<viewRays[i][1]<<" "<<viewRays[i][2]<<endl;
+        log<<"viewpoint "<<i<<" "<<viewRays[i][0]<<" "<<viewRays[i][1]<<" "<<viewRays[i][2]<<endl<<endl;
         //set viewray and upVector
         double angle = vtkMath::AngleBetweenVectors(viewRays[i], viewray0); //radian
         double axis[3], up1[3];
@@ -195,8 +258,10 @@ int main (int argc, char** argv)
         tr1->Inverse();
         tr1->GetMatrix(mat1);
         vtkMath::Normalize(up1);
+        bool skip(false);
 
-        for(int deg = 0; deg<360; deg+=scan.rotInterval){ //rotation loop
+        for(int deg = -25; deg<26; deg+=scan.rotInterval){ //rotation loop
+            bool degSkip = false;
 
             //set up/right vectors
             double up[3], right[3];
@@ -213,12 +278,10 @@ int main (int argc, char** argv)
             vtkMath::Cross(viewRays[i], up, right);
             vtkMath::Normalize(right);
 
-            log<<to_string(i)+" "+to_string(deg)<<" "<<"upVector: "<<up[0]<<" "<<up[1]<<" "<<up[2]<<endl;
-            log<<*mat<<endl;
-
-            for(double dist:scandists){ //distance loop
-                cout<<"\rStart Scanning... -view: "<<i<<"/"<<viewRays.size()<<" -deg: "<<deg<<" -dist: "<<dist<<flush;
-                scan.distance = dist;
+            for(int dist=0;dist<scandists.size();dist++){ //distance loop
+                cout<<"\rScanning... "<<++scanCount<<"/"<<totScans-skipCount<<"          "<<flush;
+                scan.distance = scandists[dist];
+                mat->Element[2][3] = scan.distance;
                 //Start!!
                 double eye[3];
                 eye[0] = -viewRays[i][0]*scan.distance;
@@ -245,10 +308,14 @@ int main (int argc, char** argv)
                 }
 
                 // Scanning
-                pcl::PointCloud<pcl::PointXYZ> cloud;
-                vector<double> xx, yy, zz;
                 vector<int> rr, gg, bb;
                 double p_coords[3], x[3], t, rgb[3];
+                //create ::Mat for depth & color
+                cv::Mat depth(scan.res_vert, scan.res_hor, CV_16U, cv::Scalar::all(0));
+                cv::Mat color(scan.res_vert, scan.res_hor, CV_8UC3, cv::Scalar(0,0,0));
+                uchar* color_data = color.data;
+                cv::Mat mask(scan.res_vert, scan.res_hor, CV_8U, cv::Scalar::all(0));
+                uchar* mask_data = mask.data;
                 int subId;
                 for(int vert = 0 ; vert<scan.res_vert;vert++){
                     for(int hor = 0 ; hor<scan.res_hor;hor++){
@@ -259,45 +326,151 @@ int main (int argc, char** argv)
                         point[2] = screenCloud.at(vert*scan.res_hor+hor).z;
                         if (tree->IntersectWithLine (eye, point, 0, t, x, p_coords, subId, cellId))
                         {
+                            double ep[3];
+                            vtkMath::Subtract(x, eye, ep);
+                            depth.at<ushort>(vert,hor) = vtkMath::Dot(ep, viewRays[i]);
+                            mask_data[vert*scan.res_hor+hor] = 255;
                             EstimateColor(data, cellId, x, rgb);
-                            rr.push_back(floor(rgb[0]+0.5));gg.push_back(floor(rgb[1]+0.5));bb.push_back(floor(rgb[2]+0.5));
-                            xx.push_back(x[0]);yy.push_back(x[1]);zz.push_back(x[2]);
-
-                            //vtkMath::Subtract(x,data->GetCenter(),x);
-                            tr->TransformPoint(x,x);
-                            cloud.push_back (PointXYZ(x[0], x[1], x[2]));
+                            color_data[vert*scan.res_hor*3+hor*3+0] = floor(rgb[2]+0.5);
+                            color_data[vert*scan.res_hor*3+hor*3+1] = floor(rgb[1]+0.5);
+                            color_data[vert*scan.res_hor*3+hor*3+2] = floor(rgb[0]+0.5);
+                             if(ply||pcd){
+                                xyz[vert*scan.res_hor+hor][0]=x[0];
+                                xyz[vert*scan.res_hor+hor][1]=x[1];
+                                xyz[vert*scan.res_hor+hor][2]=x[2];
+                                if(ply){
+                                    rr.push_back(floor(rgb[0]+0.5));gg.push_back(floor(rgb[1]+0.5));bb.push_back(floor(rgb[2]+0.5));
+                                }
+                            }
                         }
-                        //else cloud.push_back (PointXYZ(0,0,0));
-                        else{
-                            rr.push_back(0);gg.push_back(0);bb.push_back(0);
-                            xx.push_back(point[0]);yy.push_back(point[1]);zz.push_back(point[2]);
-                            //vtkMath::Subtract(point,data->GetCenter(),point);
-                            tr->TransformPoint(point,point);
-                            cloud.push_back (PointXYZ(point[0],point[1],point[2]));
+                        else if(ply||pcd){
+                            xyz[vert*scan.res_hor+hor][0]=point[0];
+                            xyz[vert*scan.res_hor+hor][1]=point[1];
+                            xyz[vert*scan.res_hor+hor][2]=point[2];
+                            if(ply){
+                                rr.push_back(0);gg.push_back(0);bb.push_back(0);
+                            }
                         }
                     } // Horizontal
                 } // Vertical
 
-                pcl::PCDWriter writer;
-                writer.writeBinaryCompressed(path+"/"+to_string(i)+"_r"+to_string(deg)+"_d"+to_string((int)scan.distance)+".pcd", cloud);
-                ofstream ofs(path+"/"+to_string(i)+"_r"+to_string(deg)+"_d"+to_string((int)scan.distance)+".ply");
-                ofs<<"ply"<<endl;
-                ofs<<"format ascii 1.0"<<endl;
-                ofs<<"comment exported in vitual_scanner"<<endl;
-                ofs<<"element vertex "<<xx.size()<<endl;
-                ofs<<"property float x"<<endl;
-                ofs<<"property float y"<<endl;
-                ofs<<"property float z"<<endl;
-                ofs<<"property uchar red"<<endl;
-                ofs<<"property uchar green"<<endl;
-                ofs<<"property uchar blue"<<endl;
-                ofs<<"end_header"<<endl;
-                for(int idx=0;idx<xx.size();idx++)
-                    ofs<<xx[idx]<<" "<<yy[idx]<<" "<<zz[idx]<<" "<<rr[idx]<<" "<<gg[idx]<<" "<<bb[idx]<<endl;
-                ofs.close();
-            }
+                //addTemplate (LINEMOD)
+                depth = (depth-minDist)*depthFactor;
+                std::vector<cv::Mat> sources;
+                sources.push_back(color);
+                sources.push_back(depth);
+                cv::Rect bBox;
+                int template_id = detector->addTemplate(sources, to_string(i), mask, &bBox);
+                cv::Mat display = color;
+                if(template_id>=0){
+                    const std::vector<cv::linemod::Template>& templates = detector->getTemplates(to_string(i), template_id);
+                    drawResponse(templates, num_modalities, display, cv::Point(bBox.x, bBox.y), detector->getT(0));
+                    //log<<to_string(i)+" "+to_string(deg)<<" "<<"upVector: "<<up[0]<<" "<<up[1]<<" "<<up[2]<<endl;
+                    log<<"template "<<template_id<<endl;
+                    log<<"distance "<<scan.distance<<endl;
+                    log<<"rotation "<<endl;
+                    log<<*mat<<endl<<endl;
+                }else failCount++;
+                std::vector<cv::linemod::Match> matches;
+                std::vector<cv::String> class_ids;
+                std::vector<cv::Mat> quantized_images;
+                detector->match(sources, 80., matches, class_ids, quantized_images);
+                //visualizing
+                cv::imshow("depth", quantized_images[1]);
+                cv::putText(display, "view: "+to_string(i)+"/"+to_string(viewRays.size())+" (deg: "+to_string(deg)+" dist: "+to_string((int)scan.distance)+")"
+                            , cv::Point(3,15), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255,255,255),0.5);
+                cv::imshow("color", display);
+                cv::imshow("mask", mask);
+
+                //printing
+                //** 1)OpenCV
+                if(cvDepth){
+                    std::string fName(path + "/" + to_string(i)+"_r"+to_string(deg)+"_d"+to_string((int)scan.distance)+".yml");
+                    cv::FileStorage fs(fName, cv::FileStorage::WRITE);
+                    fs << "depth" << depth; fs.release();
+                }
+                //** 2)PLY
+                if(ply){
+                    ofstream ofs(path+"/"+to_string(i)+"_r"+to_string(deg)+"_d"+to_string((int)scan.distance)+".ply");
+                    ofs<<"ply"<<endl;
+                    ofs<<"format ascii 1.0"<<endl;
+                    ofs<<"comment exported in vitual_scanner"<<endl;
+                    ofs<<"element vertex "<<scan.res_vert*scan.res_hor<<endl;
+                    ofs<<"property float x"<<endl;
+                    ofs<<"property float y"<<endl;
+                    ofs<<"property float z"<<endl;
+                    ofs<<"property uchar red"<<endl;
+                    ofs<<"property uchar green"<<endl;
+                    ofs<<"property uchar blue"<<endl;
+                    ofs<<"end_header"<<endl;
+                    for(int idx=0;idx<scan.res_vert*scan.res_hor;idx++){
+                        if(ply_rot){
+                            double xyz_rot[3];
+                            tr->TransformPoint(xyz[idx],xyz_rot);
+                            ofs<<xyz_rot[0]<<" "<<xyz_rot[1]<<" "<<xyz_rot[2]<<" "<<rr[idx]<<" "<<gg[idx]<<" "<<bb[idx]<<endl;
+                        }
+                        else
+                            ofs<<xyz[idx][0]<<" "<<xyz[idx][1]<<" "<<xyz[idx][2]<<" "<<rr[idx]<<" "<<gg[idx]<<" "<<bb[idx]<<endl;
+                    }
+                    ofs.close();
+                }
+
+                //** 3)PCD
+                if(pcd){
+                    pcl::PointCloud<pcl::PointXYZ> cloud;
+                    for(int idx=0;idx<scan.res_vert*scan.res_hor;idx++){
+                        if(ply_rot){
+                            double xyz_rot[3];
+                            tr->TransformPoint(xyz[idx],xyz_rot);
+                            cloud.push_back(PointXYZ(xyz_rot[0],xyz_rot[1],xyz_rot[2]));
+                        }
+                        else
+                            cloud.push_back(PointXYZ(xyz[idx][0],xyz[idx][1],xyz[idx][2]));
+                    }
+                    pcl::PCDWriter writer;
+                    writer.writeBinaryCompressed(path+"/"+to_string(i)+"_r"+to_string(deg)+"_d"+to_string((int)scan.distance)+".pcd", cloud);
+                }
+                char key = (char)cv::waitKey(10);
+                if (key == 'q')
+                    break;
+
+                switch (key)
+                {
+                case 'h':
+                    PrintKeyUsage();
+                    break;
+                case 'w':
+                    writeLinemod(detector, path+"/"+"templates.yml");
+                    cout<<endl<<"w -> printed the template in "+path+"/"+"templates.yml"<<endl;
+                    break;
+                case 'v':
+                    skip = true;
+                    skipCount += scandists.size()*(floor((360-deg)/scan.rotInterval)-1)+scandists.size()-dist-1;
+                    cout<<endl<<"v -> to next view"<<endl;
+                    break;
+                case 'd':
+                    degSkip = true;
+                    skipCount += scandists.size()-dist-1;
+                    cout<<endl<<"v -> to next view"<<endl;
+                    break;
+                case 'f':
+                    cout<<endl<<"f -> # of failed templates: "<<failCount<<endl;
+                    break;
+                case 'p':
+                    cout<<endl<<"p -> pause press any key "<<failCount<<endl;
+                    cv::waitKey();
+                    break;
+
+                default:
+                    ;
+                }
+                if(skip) break;
+                if(degSkip) break;
+            }if(skip) break;
         }
     }log.close();
+    writeLinemod(detector, path+"/"+"templates.yml");
+    cout<<endl<<"failed for "<<failCount<<" templates"<<endl;
     return 0;
 }
 
@@ -356,4 +529,45 @@ void EstimateColor(vtkPolyData* poly, vtkIdType cellId, double* point, double* r
     vtkMath::MultiplyScalar(rgb_c, c_w);
     vtkMath::Add(rgb_a, rgb_b, rgb);
     vtkMath::Add(rgb, rgb_c, rgb);
+}
+
+void drawResponse(const std::vector<cv::linemod::Template>& templates,
+    int num_modalities, cv::Mat& dst, cv::Point offset, int T)
+{
+    static const cv::Scalar COLORS[5] = { CV_RGB(0, 0, 255),
+                                          CV_RGB(0, 255, 0),
+                                          CV_RGB(255, 255, 0),
+                                          CV_RGB(255, 140, 0),
+                                          CV_RGB(255, 0, 0) };
+
+    for (int m = 0; m < num_modalities; ++m)
+    {
+        // NOTE: Original demo recalculated max response for each feature in the TxT
+        // box around it and chose the display color based on that response. Here
+        // the display color just depends on the modality.
+        cv::Scalar color = COLORS[m];
+
+        for (int i = 0; i < (int)templates[m].features.size(); ++i)
+        {
+            cv::linemod::Feature f = templates[m].features[i];
+            cv::Point pt(f.x + offset.x, f.y + offset.y);
+            cv::circle(dst, pt, T / 2, color);
+        }
+    }
+}
+
+static void writeLinemod(const cv::Ptr<cv::linemod::Detector>& detector, const std::string& filename)
+{
+    cv::FileStorage fs(filename, cv::FileStorage::WRITE);
+    detector->write(fs);
+
+    std::vector<cv::String> ids = detector->classIds();
+    fs << "classes" << "[";
+    for (int i = 0; i < (int)ids.size(); ++i)
+    {
+        fs << "{";
+        detector->writeClass(ids[i], fs);
+        fs << "}"; // current class
+    }
+    fs << "]"; // classes
 }
