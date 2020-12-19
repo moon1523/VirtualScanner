@@ -236,14 +236,16 @@ int main (int argc, char** argv)
     if(path!=".") system(("mkdir "+path).c_str());
     ofstream log(path+"/labels.txt");
     log<<"maxDist "<<maxDist<<endl;
-    log<<"minDist "<<minDist<<endl<<endl;
+    log<<"minDist "<<minDist<<endl;
+    log<<"model "<<modelFileName<<endl;
+    log<<"viewpoint "<<viewFileName<<endl<<endl;
     vtkTransform* tr1 = vtkTransform::New ();
     vtkTransform* tr = vtkTransform::New ();
     vtkMatrix4x4* mat = vtkMatrix4x4::New();
     vtkMatrix4x4* mat1 = vtkMatrix4x4::New();
 
-    //int totScans = viewRays.size()*scandists.size()*360./(double)scan.rotInterval;
-    int totScans = viewRays.size()*scandists.size()*11;
+    int totScans = viewRays.size()*scandists.size()*360./(double)scan.rotInterval;
+    //int totScans = viewRays.size()*scandists.size()*11;
     int failCount(0), scanCount(0), skipCount(0);
     for(int i=0;i<viewRays.size();i++){ //viewpoint loop
 
@@ -260,7 +262,7 @@ int main (int argc, char** argv)
         vtkMath::Normalize(up1);
         bool skip(false);
 
-        for(int deg = -25; deg<26; deg+=scan.rotInterval){ //rotation loop
+        for(int deg = 0; deg<360; deg+=scan.rotInterval){ //rotation loop
             bool degSkip = false;
 
             //set up/right vectors
